@@ -1,4 +1,4 @@
-# First of I mainly followed the techandtrains.com blog to figure most of this out, thank you Gregory.
+# First of I mainly followed several blogs to figure most of this out.
 # If you are using vagrant, configure network in brdige mode so that you are not NATed and have a unique IP
 # YOu can ignore the vagrant commands if you are directly setting up CentOS7 on VirtualBox.
 # I recommend osboxes.org to get a prebuilt vanilla image, you are guys are very cool!.
