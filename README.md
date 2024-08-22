@@ -1,4 +1,4 @@
-# OpenStack Deployment With Kolla Ansible For High Availability
+# OpenStack Deployment With Kolla Ansible | High Availability
 
 <p align="center">
   <img src="images/OpenStack_Logo.png" alt="OpenStack Logo" width="500"/>
