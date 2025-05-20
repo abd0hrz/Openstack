@@ -1,101 +1,159 @@
-This is a gist to setup Packstack-OpenStack on a CentOS VirtualBox. I had some 'challenges' in setting up Packstack on a VM and had to figure out how to solve it, posting this text file so that others wont find it difficult, and can install Packstack right away.
+# Packstack-OpenStack Setup on CentOS (VirtualBox)
 
-# First of I mainly followed several blogs to figure most of this out.
-# If you are using vagrant, configure network in brdige mode so that you are not NATed and have a unique IP
-# YOu can ignore the vagrant commands if you are directly setting up CentOS7 on VirtualBox.
-# I recommend osboxes.org to get a prebuilt vanilla image, you are guys are very cool!.
+This guide outlines the steps to set up **Packstack (OpenStack Kilo)** on a **CentOS 7** virtual machine using **VirtualBox**. I faced several challenges while setting it up, so I’ve compiled this to help others get started smoothly.
 
-# Install vagrant
+> 💡 If you’re using **Vagrant**, configure the network in **bridge mode** to avoid NAT and get a unique IP address.  
+> 💡 You can skip the Vagrant instructions if you're setting up CentOS 7 directly on VirtualBox.  
+> 🔗 I recommend [osboxes.org](https://www.osboxes.org/) for ready-to-use CentOS images.
+
+---
+
+## Step-by-Step Installation
+
+### 1. Vagrant Setup (Optional)
+
+```bash
 yum install -y vagrant
 
-# Download the box and add in vagrantboxes folder
+# Add CentOS 7 box
 vagrant box add CenOS7x64 https://github.com/tommy-muehle/puppet-vagrant-boxes/releases/download/1.1.0/centos-7.0-x86_64.box
 
-# Initialize vagrant and create a vagrantconfig file, where every attribute of the box can be configured
+# Initialize Vagrant
 vagrant init
 
-# Load the instance into virtualbox
+# Start the VM
 vagrant up
+```
 
-# After the VM has been setup and follow along
-# Make sure the system is upto date  
+---
+
+### 2. Update System and Reboot
+
+```bash
 yum update -y
-
-# Reboot the system
 shutdown -r now
+```
 
-# Download openstack kilo rpm
+---
+
+### 3. Install Required Repositories and Packages
+
+```bash
+# Add OpenStack Kilo repository
 yum install -y https://repos.fedorapeople.org/repos/openstack/openstack-kilo/rdo-release-kilo-1.noarch.rpm
 
-# Install epel release and packstack and a few other packages
-yum install -y epel-release openstack-packstack wget screen git 
+# Install Packstack and other utilities
+yum install -y epel-release openstack-packstack wget screen git
 
-# Install packages recommended by openstack dev
-yum install -y python-devel openssl-devel 
-yum install -y python-pip git gcc libxslt-devel mysql-devel
-yum install -y postgresql-devel libffi-devel libvirt-devel graphviz yum install -y sqlite-devel
-sudo pip-python install tox
+# Recommended developer tools
+yum install -y python-devel openssl-devel python-pip gcc git libxslt-devel mysql-devel \
+postgresql-devel libffi-devel libvirt-devel graphviz sqlite-devel
 
-# If postgres is preferred over mariadb or mysql, install postgres
-# client and server
-yum install -y postgresql-server 
-yum install -y postgresql-client
+# Python packages
+pip install tox
+```
 
-# Start the ssh daemon
-sudo systemctl start sshd
+---
 
-# Stop and Remove default network manager as neutron will manage network
+### 4. Optional: PostgreSQL (Instead of MariaDB)
+
+```bash
+yum install -y postgresql-server postgresql-client
+```
+
+---
+
+### 5. Network Configuration
+
+```bash
+# Start SSH
+systemctl start sshd
+
+# Disable and remove NetworkManager (neutron will handle networking)
 service NetworkManager stop
-yum remove NetworkManager
+yum remove -y NetworkManager
 
-# Network would be turned off, so start network and enable on reboot
+# Enable standard network service
 systemctl start network.service
 systemctl enable network.service
-
-# Check status 
 chkconfig network on
 systemctl status network.service
+```
 
-# Change the /etc/hosts file to make sure that hostname and associated ip is present.
-# This part is not mentioned in the RDO documentation.
-# I lost a lot of time here, it is a trial change, but without this rabbitmqserver will not start up 
-# when packstack is trying to turn on all the services
+---
 
-echo "127.0.0.1 localhost "hostname" >> /etc/hosts
-#example:: echo "127.0.0.1 localhost osboxes" >> /etc/hosts
+### 6. Hostname Configuration
 
-#Turn on rabbitmq-server and enable on reboot
+Edit `/etc/hosts` and add:
+
+```bash
+127.0.0.1   localhost your-hostname
+# Example:
+# 127.0.0.1   localhost osboxes
+```
+
+This is crucial for RabbitMQ to start properly during Packstack installation.
+
+---
+
+### 7. Start RabbitMQ
+
+```bash
 systemctl start rabbitmq-server
 systemctl enable rabbitmq-server
+```
 
-# Now its time to start packstack, install as a normal user (will be prompted for password.
-# if not want to be disturned, just create a env variable for the sudo password
-packstack --install-hosts=127.0.0.1 --use-epel=n --provision-demo=n 
+---
 
-# Now openstack should be setup and running on 127.0.0.1
-# login credentials would be stored in  keystonerc_admin
-# Have fun!!, or not ..
+### 8. Install OpenStack with Packstack
 
-# Download, extract and load a CoreOS image 
+```bash
+packstack --install-hosts=127.0.0.1 --use-epel=n --provision-demo=n
+```
+
+After completion, login credentials will be stored in the file `keystonerc_admin`.
+
+---
+
+## Optional: Load CoreOS Image into Glance
+
+```bash
 wget http://stable.release.core-os.net/amd64-usr/current/coreos_production_openstack_image.img.bz2
 bunzip2 coreos_production_openstack_image.img.bz2
+
 glance image-create --name "CoreOS" --container-format bare \
---disk-format qcow2 --file coreos_production_openstack_image.img \
---is-public True
+  --disk-format qcow2 --file coreos_production_openstack_image.img \
+  --is-public True
+```
 
-# Setup virtual proxy using VNC
-openstack-config --set /etc/nova/nova.conf DEFAULT \ novncproxy_base_url http://192.168.1.24:6080/vnc_auto.html
+---
 
-# Using QEMU instead of KVM as the hypervisor as  we are running on a VM
+## Configure VNC and QEMU (Virtualized Environments)
+
+```bash
+# Set VNC proxy URL
+openstack-config --set /etc/nova/nova.conf DEFAULT \
+  novncproxy_base_url http://192.168.1.24:6080/vnc_auto.html
+
+# Use QEMU instead of KVM (running inside a VM)
 openstack-config --set /etc/nova/nova.conf libvirt virt_type qemu
-openstack-config --set /etc/nova/nova.conf DEFAULT compute_driver \ libvirt.LibvirtDriver setsebool -P virt_use_execmem on \
+openstack-config --set /etc/nova/nova.conf DEFAULT compute_driver libvirt.LibvirtDriver
+
+# Enable required SELinux setting
+setsebool -P virt_use_execmem on
+
+# Symlink QEMU binary if needed
 ln -s /usr/libexec/qemu-kvm /usr/bin/qemu-system-x86_64
+
+# Restart services
 service libvirtd restart
 service openstack-nova-compute restart
+```
 
-# Finally all done!!
-# Now 
-# To start using coreOS need to setup discovery tokens,
-# configure etcd etc which can be done through the coreos official documentation
-# Now have fun!!
+---
 
+## Done!
+
+Your Packstack OpenStack environment should now be up and running on **127.0.0.1**.
+
+To continue with CoreOS or additional OpenStack services, refer to official documentation.
