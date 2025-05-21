@@ -1,159 +1,787 @@
-# Packstack-OpenStack Setup on CentOS (VirtualBox)
+# OpenStack Deployment With Kolla Ansible For High Availability
 
-This guide outlines the steps to set up **Packstack (OpenStack Kilo)** on a **CentOS 7** virtual machine using **VirtualBox**. I faced several challenges while setting it up, so I’ve compiled this to help others get started smoothly.
+<p align="center">
+  <img src="images/OpenStack_Logo.png" alt="OpenStack Logo" width="500"/>
+</p>
 
-> 💡 If you’re using **Vagrant**, configure the network in **bridge mode** to avoid NAT and get a unique IP address.  
-> 💡 You can skip the Vagrant instructions if you're setting up CentOS 7 directly on VirtualBox.  
-> 🔗 I recommend [osboxes.org](https://www.osboxes.org/) for ready-to-use CentOS images.
+This project documents the complete process of deploying a highly available (HA) OpenStack cloud environment using **Kolla-Ansible**. The deployment includes:
+
+- Multi-node setup (controller, compute, and storage nodes)
+- Full containerization using **Docker**
+- **Galera cluster**, **HAProxy**, and **Keepalived** for HA
+- Centralized configuration using **Ansible**
+- Virtual machines provisioned with **KVM/QEMU**
+
+The guide is designed to help DevOps engineers, cloud architects, and advanced system administrators replicate the deployment in a lab or production-ready setup.
+
+**Tested Environment:**  
+> 🖥️ OS: Rocky Linux 9  
+> ☁️ Cloud Stack: OpenStack `2024.2`  
+> ⚙️ Tools: Kolla-Ansible, Docker, Ansible
+
+> 📘 **Note:** This documentation assumes a basic understanding of Linux, networking, and Ansible.
 
 ---
 
-## Step-by-Step Installation
+## 🧱 Environment Overview
 
-### 1. Vagrant Setup (Optional)
+- The deployment was performed in a virtualized lab using VMWare Workstation. 
+- One base virtual machine (VM) was created and then cloned to spawn additional nodes with the appropriate roles assigned.
+- All VMs run **Rocky Linux 9.4** and share the same hardware specs initially, with modifications based on the role.
+
+> 📥 **Download Rocky Linux 9.4 ISO**:  
+> [https://rockylinux.org/download](https://rockylinux.org/download)
+---
+
+## 🧩 Roles of Each Node in the OpenStack Deployment
+
+This section describes the specific responsibilities and key services hosted on each node type within the HA OpenStack cluster.
+
+
+### 🧠 Controller Node
+
+**Primary Role:**  
+The "brain" of the OpenStack cluster.
+
+**Key Services:**
+- `Keystone`: Identity management
+- `Glance`: Image storage for VMs
+- `Nova API`: Compute API endpoints
+- `Horizon`: Web dashboard interface
+- `MariaDB/Galera`: Highly available database cluster
+- `RabbitMQ`: Message queuing between OpenStack services
+
+**Responsibility:**  
+Handles orchestration, authentication, database operations, and API endpoints for all OpenStack components.
+
+---
+
+### 🧮 Compute Node
+
+**Primary Role:**  
+Runs virtual machines (VMs) and provides compute resources.
+
+**Key Services:**
+- `Nova Compute`: Manages VM lifecycle (create, delete, migrate, etc.)
+- `Libvirt/KVM`: Hypervisor interface to run VMs
+
+**Responsibility:**  
+Provides vCPUs, RAM, and local storage for VMs. Compute nodes scale horizontally — adding more nodes increases cluster capacity.
+
+---
+
+### 🌐 Network Node
+
+**Primary Role:**  
+Manages all networking components of the OpenStack environment.
+
+**Key Services:**
+- `Neutron`: Networking service (routers, subnets, floating IPs)
+- `L3 Agent`: Routing and NAT for VM networks
+- `DHCP Agent`: Dynamic IP assignment to VMs
+- `OVS` / `LinuxBridge`: Virtual switch to connect instances
+
+**Responsibility:**  
+Ensures full VM connectivity, external access, router/NAT functionality, and applies security group rules.
+
+---
+
+### 💾 Storage Node
+
+**Primary Role:**  
+Provides persistent storage to VMs (and optionally object storage).
+
+**Key Services:**
+- `Cinder Volume`: Block storage for VMs using LVM as the backend
+- *(Optional)* `Swift`: Object storage (not enabled in this deployment)
+
+**Responsibility:**  
+Manages volumes, snapshots, and backups. In our setup, LVM aggregates additional disks into a single volume group (`cinder-volumes`) for dynamic block provisioning.
+
+
+---
+
+## 🖥️ Deployment Architecture
+
+This section outlines the architecture of the OpenStack HA deployment, including the roles assigned to each node, their hardware specifications, and how they are organized to ensure scalability, high availability, and separation of concerns.
+
+
+| Hostname     | Role                 | IPv4            | vCPU | RAM (GB) | Storage (GB)  | Notes                       |
+|--------------|----------------------|-----------------|------|----------|---------------|-----------------------------|
+| controller01 | Controller Node      | 192.168.142.141 | 2    | 8        | 40            | Also used to deploy Kolla   |
+| controller02 | Controller Node      | 192.168.142.142 | 2    | 8        | 40            |                             |
+| controller03 | Controller Node      | 192.168.142.143 | 2    | 8        | 40            |                             |
+| compute01    | Compute Node         | 192.168.142.151 | 2    | 8        | 40            | Virtualization enabled      |
+| compute02    | Compute Node         | 192.168.142.152 | 2    | 8        | 40            | Virtualization enabled      |
+| network01    | Network Node         | 192.168.142.161 | 2    | 8        | 40            |                             |
+| network02    | Network Node         | 192.168.142.162 | 2    | 8        | 40            |                             |
+| storage01    | Storage (Cinder LVM) | 192.168.142.171 | 2    | 8        | 40 (+10 GB)   | LVM volume for Cinder       |
+| storage02    | Storage (Cinder LVM) | 192.168.142.172 | 2    | 8        | 40 (+10 GB)   | LVM volume for Cinder       |
+
+> 📌 **Note:** Each VM was cloned from `controller01` and then customized (hostname, static IP, NICs, etc.).
+
+---
+
+## 🔧 VM Networking
+
+Each VM includes at least two network interfaces:
+
+- `ens160`: Internal/OpenStack management network
+- `ens192`: External network for floating IPs and external access
+
+NIC names may vary depending on the hypervisor configuration.
+
+> ⚠️ **Reminder:** Always confirm NIC names using `ip a` after VM creation.
+
+
+## ⚙️ VM Creation and OS Configuration
+
+This section covers the step-by-step creation of the base Rocky Linux VM, cloning it to form the OpenStack cluster, OS preparation, static IP setup, and SSH key configuration.
+
+
+### 🖥️ Creating and Installing Base Rocky Linux VM
+
+1. **Create a virtual machine** named `controller01` which will serve as the base image.  
+   It will be cloned later to create other nodes, and each clone will be customized.
+2. Create the VM using the previously specified hardware (e.g., 2 vCPUs, 8 GB RAM, 40 GB disk).
+
+![Screenshot 1](images/pic1.png)
+
+3. **Add another NIC** to the VM to support internal and external network separation.
+
+![Screenshot 2](images/pic2.png)
+
+![Screenshot 3](images/pic3.png)
+
+![Screenshot 4](images/pic4.png)
+
+4. Confirm the final specifications before finishing the setup.
+
+![Screenshot 5](images/pic5.png)
+
+5. Start the VM and begin installing **Rocky Linux 9.4**.
+
+![Screenshot 6](images/pic6.png)
+
+6. Choose your preferred installation language.
+
+![Screenshot 7](images/pic7.png)
+
+7. Configure installation settings:
+   - Partitioning
+   - Networking
+   - Time zone
+   - User creation
+
+![Screenshot 8](images/pic8.png)
+
+8. **Create a user named `kolla`** to be used for Kolla Ansible deployment.
+
+
+9.  **Network Configuration:**
+   - Keep **DHCP enabled** on the first NIC (we’ll assign a static IP later).
+   - **Disable IPv4** on the second NIC (e.g., `ens192`).
+
+![Screenshot 9](images/pic9.png)
+
+![Screenshot 10](images/pic10.png)
+
+   - Disable → Enable the NIC to apply settings.
+
+![Screenshot 11](images/pic11.png)
+
+10.  Finish configuration and begin the OS installation.
+
+![Screenshot 12](images/pic12.png)
+
+11.  After reboot, log in as `root` and update the system: 
+   ```bash
+   sudo dnf update -y
+   ```
+
+![Screenshot 13](images/pic13.png)
+
+12.  Add the `kolla` user to the `wheel` group:
+   ```bash
+   usermod -aG wheel kolla
+   grep wheel /etc/group
+   ```
+
+![Screenshot 14](images/pic14.png)
+
+13.  Edit the sudoers file to allow passwordless sudo for the `wheel` group:
+    
+   ```bash
+   visudo
+   ```
+    
+   - Find:
+   
+   ```bash
+   %wheel  ALL=(ALL)       ALL
+   ```
+   
+   - Comment that line and uncomment:
+   ```bash
+   %wheel  ALL=(ALL)       NOPASSWD: ALL
+   ```
+
+![Screenshot 15](images/pic15.png)
+
+---
+
+### 📦 Cloning the Base VM
+
+1. Shut down the base VM (`controller01`) before cloning.
+2. Use **full independent clone** option.
+
+![Screenshot 16](images/pic16.png)
+
+![Screenshot 17](images/pic17.png)
+
+![Screenshot 18](images/pic18.png)
+
+![Screenshot 19](images/pic19.png)
+
+3. Repeat the process to create the full architecture:
+   - `controller02`, `controller03`, `compute01`, `compute02`, `network01`, `network02`, `storage01`, `storage02`.
+
+![Screenshot 20](images/pic20.png)
+
+---
+
+### 🧾 Configure Hostname and Static IP for All VMs
+
+Each VM needs a **unique hostname** and **static IP**.
+
+1. Set the hostname:
+    ```bash
+    sudo hostnamectl set-hostname <hostname>
+    ```
+2. Validate:
+    ```bash
+    hostname
+    ```
+
+![Screenshot 21](images/pic21.png)
+
+3. Set static IP for `ens160`:
+    ```bash
+    nmcli device status
+    ```
+
+![Screenshot 22](images/pic22.png)
+
+  ```bash
+  sudo nmcli con mod ens160 ipv4.addresses 192.168.142.141/24
+  sudo nmcli con mod ens160 ipv4.gateway 192.168.142.2
+  sudo nmcli con mod ens160 ipv4.dns 192.168.142.2
+  sudo nmcli con mod ens160 ipv4.method manual
+  ```
+
+![Screenshot 23](images/pic23.png)
+
+  ```bash
+  sudo nmcli con down ens160 && sudo nmcli con up ens160
+  ip a show ens160
+  ```
+
+![Screenshot 26](images/pic26.png)
+
+Repeat for each VM with appropriate IP and hostname.
+
+---
+
+### 📁 Configure `/etc/hosts` on `controller01`
+
+- This node will act as the Kolla-Ansible deployment host. 
+- This file ensures all nodes in the cluster can be referenced by hostname during the Kolla Ansible deployment.
+- DNS entries in other nodes will be taken care by Ansible.
+
+
+1. Open the hosts file:
+    ```bash
+    sudo nano /etc/hosts
+    ```
+
+![Screenshot 27](images/pic27.png)
+
+2. Add these entries:
+    ```text
+    192.168.142.141 controller01
+    192.168.142.142 controller02
+    192.168.142.143 controller03
+    192.168.142.151 compute01
+    192.168.142.152 compute02
+    192.168.142.161 network01
+    192.168.142.162 network02
+    192.168.142.171 storage01
+    192.168.142.172 storage02
+    ```
+
+![Screenshot 28](images/pic28.png)
+
+3. Test reachability:
+    ```bash
+    for host in controller01 controller02 controller03 compute01 compute02 network01 network02 storage01 storage02; do
+      ping -c 1 $host >/dev/null && echo "$host is reachable" || echo "$host is NOT reachable"
+    done
+    ```
+
+![Screenshot 29](images/pic29.png)
+
+---
+
+### 🧬 Enable Virtualization on Compute VMs
+
+1. Open VM settings for each **compute node**.
+
+![Screenshot 30](images/pic30.png)
+
+2. Enable virtualization in the hardware settings.
+
+![Screenshot 31](images/pic31.png)
+
+3. Repeat for `compute02`.
+
+---
+
+### 💽 Attach New Disk to Storage VMs (for Cinder LVM)
+
+1. Add a new virtual disk (20GB or more) to each **storage node**.
+
+![Screenshot 32](images/pic32.png)
+
+![Screenshot 33](images/pic33.png)
+
+![Screenshot 34](images/pic34.png)
+
+![Screenshot 35](images/pic35.png)
+
+![Screenshot 36](images/pic36.png)
+
+2. Verify:
+    ```bash
+    lsblk
+    ```
+
+![Screenshot 37](images/pic37.png)
+
+3. Initialize and configure LVM:
+    ```bash
+    sudo pvcreate /dev/nvme0n2
+    sudo vgcreate cinder-volumes /dev/nvme0n2
+    sudo vgs
+    ```
+
+![Screenshot 38](images/pic38.png)
+
+4. Repeat on `storage02`.
+
+---
+
+### 🔐 Generate SSH Keys for `kolla` User
+
+Now, we will generate an SSH key for the `kolla` user on `controller01` and copy the public key to all other nodes under the same user (`kolla`). This is essential for password less SSH access, which Kolla Ansible uses to operate on remote nodes.
+
+
+1. Log in as `kolla` on `controller01`.
+
+2. Generate key pair:
+    ```bash
+    ssh-keygen -t rsa -b 4096 -N "" -f ~/.ssh/id_rsa
+    ```
+
+![Screenshot 39](images/pic39.png)
+
+3. Copy public key to all nodes:
+    ```bash
+    for host in controller01 controller02 controller03 compute01 compute02 network01 network02 storage01 storage02; do
+      ssh-copy-id kolla@$host
+    done
+    ```
+
+> 📌 You’ll be prompted for the `kolla` user password on each host.
+
+4. Test:
+    ```bash
+    ssh kolla@controller03
+    ```
+
+![Screenshot 40](images/pic40.png)
+
+---
+
+## 🚀 Installing OpenStack with Kolla-Ansible
+
+All the following steps are executed on the **deployment node** (`controller01`), which orchestrates the entire OpenStack environment using **Kolla Ansible**.
+
+---
+
+### 📦 Install Dependencies
+
+1. **Update system packages:**
+
+   ```bash
+   sudo dnf update -y
+   ```
+
+2. **Install Python build dependencies:**
+
+   ```bash
+   sudo dnf install git python3-devel libffi-devel gcc openssl-devel python3-libselinux -y
+   ```
+
+![Screenshot 41](images/pic41.png)
+
+3. **Install Ansible:**
+
+   ```bash
+   sudo pip3 install ansible-core
+   ```
+
+![Screenshot 42](images/pic42.png)
+
+   > ⚠️ If you face a `PATH` warning, update your shell configuration:
+
+![Screenshot 43](images/pic43.png)
+
+   ```bash
+   nano ~/.bashrc
+   # Add this line
+   export PATH="/usr/local/bin:$PATH"
+   source ~/.bashrc
+   ```
+
+---
+
+### 🧰 Install Kolla Ansible
+
+1. **Install `kolla-ansible` via pip:**
+
+   ```bash
+   sudo pip3 install kolla-ansible
+   ```
+
+![Screenshot 44](images/pic44.png)
+
+2. **Create the configuration directory:**
+
+   ```bash
+   sudo mkdir -p /etc/kolla
+   sudo chown $USER:$USER /etc/kolla
+   ```
+
+![Screenshot 45](images/pic45.png)
+
+3. **Copy example config files:**
+
+   ```bash
+   cp -r /usr/local/share/kolla-ansible/etc_examples/kolla/* /etc/kolla/
+   ```
+
+![Screenshot 46](images/pic46.png)
+
+4. **Copy the multinode inventory file to the current directory:**
+
+   ```bash
+   cp /usr/local/share/kolla-ansible/ansible/inventory/multinode .
+   ```
+
+   > ℹ️ We're using **multinode** to deploy a highly available OpenStack setup across multiple nodes.
+
+![Screenshot 47](images/pic47.png)
+
+5. **Install Ansible Galaxy dependencies:**
+
+   ```bash
+   kolla-ansible install-deps
+   ```
+
+![Screenshot 48](images/pic48.png)
+
+---
+
+### ⚙️ Configure Main Files
+
+#### `globals.yml`
+
+* **Path:** `/etc/kolla/globals.yml`
+* **Purpose:** Main config file for customizing OpenStack deployment.
 
 ```bash
-yum install -y vagrant
+nano /etc/kolla/globals.yml
+```
 
-# Add CentOS 7 box
-vagrant box add CenOS7x64 https://github.com/tommy-muehle/puppet-vagrant-boxes/releases/download/1.1.0/centos-7.0-x86_64.box
+Paste the following configuration:
 
-# Initialize Vagrant
-vagrant init
+<details>
+<summary>🔽 Click to Expand `globals.yml` Example</summary>
 
-# Start the VM
-vagrant up
+```yaml
+##########################
+# General Configuration
+##########################
+config_strategy: "COPY_ALWAYS"
+kolla_base_distro: "rocky"
+openstack_release: "2024.2"
+network_address_family: "ipv4"
+kolla_container_engine: docker
+docker_configure_for_zun: "yes"
+containerd_configure_for_zun: "yes"
+docker_apt_package_pin: "5:20.*"
+
+##########################
+# Network Configuration
+##########################
+network_interface: "ens160"
+neutron_external_interface: "ens192"
+kolla_internal_vip_address: "192.168.142.250"
+
+##########################
+# OpenStack Core Services
+##########################
+enable_openstack_core: "yes"
+enable_keystone: "{{ enable_openstack_core | bool }}"
+enable_glance: "{{ enable_openstack_core | bool }}"
+enable_nova: "{{ enable_openstack_core | bool }}"
+enable_neutron: "{{ enable_openstack_core | bool }}"
+enable_heat: "{{ enable_openstack_core | bool }}"
+enable_horizon: "{{ enable_openstack_core | bool }}"
+
+##########################
+# Networking Plugin
+##########################
+neutron_plugin_agent: "openvswitch"
+enable_kuryr: "yes"
+
+##########################
+# High Availability
+##########################
+enable_haproxy: "yes"
+enable_keepalived: "{{ enable_haproxy | bool }}"
+
+##########################
+# Database & Messaging
+##########################
+enable_mariadb: "yes"
+enable_memcached: "yes"
+enable_etcd: "yes"
+
+##########################
+# Telemetry & Monitoring
+##########################
+enable_ceilometer: "yes"
+enable_aodh: "yes"
+enable_gnocchi: "yes"
+enable_gnocchi_statsd: "yes"
+enable_prometheus: "yes"
+enable_grafana: "yes"
+
+##########################
+# Block Storage (Cinder)
+##########################
+enable_cinder: "yes"
+enable_cinder_backend_lvm: "yes"
+cinder_volume_group: "cinder-volumes"
+
+##########################
+# Containerized Application Services
+##########################
+enable_zun: "yes"
+enable_horizon_zun: "{{ enable_zun | bool }}"
+
+##########################
+# Image Service Configuration (Glance)
+##########################
+glance_backend_file: "yes"
+glance_file_datadir_volume: "/mnt/glance"
+```
+
+</details>
+
+---
+
+#### `passwords.yml`
+
+* **Path:** `/etc/kolla/passwords.yml`
+* **Purpose:** Stores auto-generated or custom passwords for all OpenStack services.
+* **Generate it with:**
+
+  ```bash
+  kolla-genpwd
+  ```
+
+![Screenshot 49](images/pic49.png)
+
+---
+
+#### `multinode` Inventory File
+
+* Defines node roles and groups for the Ansible deployment.
+
+```ini
+[control]
+controller01
+controller02
+controller03
+
+[network]
+network01
+network02
+
+[compute]
+compute01
+compute02
+
+[monitoring]
+controller01
+
+[storage]
+storage01
+storage02
+
+[all:vars]
+ansible_user=kolla
+ansible_become=True
+
+[deployment]
+localhost ansible_connection=local
 ```
 
 ---
 
-### 2. Update System and Reboot
+### 📤 Deploy OpenStack
 
-```bash
-yum update -y
-shutdown -r now
-```
+1. **Bootstrap the servers:**
 
----
+   ```bash
+   kolla-ansible bootstrap-servers -i ./multinode
+   ```
 
-### 3. Install Required Repositories and Packages
+![Screenshot 50](images/pic50.png)
 
-```bash
-# Add OpenStack Kilo repository
-yum install -y https://repos.fedorapeople.org/repos/openstack/openstack-kilo/rdo-release-kilo-1.noarch.rpm
+2. **Run pre-deployment checks:**
 
-# Install Packstack and other utilities
-yum install -y epel-release openstack-packstack wget screen git
+   ```bash
+   kolla-ansible prechecks -i ./multinode
+   ```
 
-# Recommended developer tools
-yum install -y python-devel openssl-devel python-pip gcc git libxslt-devel mysql-devel \
-postgresql-devel libffi-devel libvirt-devel graphviz sqlite-devel
+![Screenshot 51](images/pic51.png)
 
-# Python packages
-pip install tox
-```
+3. **Deploy OpenStack:**
 
----
+   ```bash
+   kolla-ansible deploy -i ./multinode
+   ```
 
-### 4. Optional: PostgreSQL (Instead of MariaDB)
+![Screenshot 52](images/pic52.png)
 
-```bash
-yum install -y postgresql-server postgresql-client
-```
+4. **Validate service configurations:**
 
----
+   ```bash
+   kolla-ansible validate-config -i ./multinode
+   ```
 
-### 5. Network Configuration
-
-```bash
-# Start SSH
-systemctl start sshd
-
-# Disable and remove NetworkManager (neutron will handle networking)
-service NetworkManager stop
-yum remove -y NetworkManager
-
-# Enable standard network service
-systemctl start network.service
-systemctl enable network.service
-chkconfig network on
-systemctl status network.service
-```
+![Screenshot 53](images/pic53.png)
 
 ---
 
-### 6. Hostname Configuration
+### 🧪 Using OpenStack After Deployment
 
-Edit `/etc/hosts` and add:
+1. **Post-deployment config (generates `clouds.yaml`):**
+
+   ```bash
+   kolla-ansible post-deploy
+   ```
+
+![Screenshot 54](images/pic54.png)
+
+2. **Verify clouds.yaml file:**
+
+   ```bash
+   ls /etc/kolla/clouds.yaml
+   ```
+
+![Screenshot 55](images/pic55.png)
+
+3. **Install OpenStack CLI:**
+
+   ```bash
+   pip install python-openstackclient -c https://releases.openstack.org/constraints/upper/master
+   ```
+
+4. **Test the deployment:**
+
+- Try to list the services:
 
 ```bash
-127.0.0.1   localhost your-hostname
-# Example:
-# 127.0.0.1   localhost osboxes
+openstack service list
 ```
 
-This is crucial for RabbitMQ to start properly during Packstack installation.
+![Screenshot 56](images/pic56.png)
+
+- Source OpenStack admin credentials file (`admin-openrc.sh`) that allows you to interact with the OpenStack CLI
+
+```bash
+source /etc/kolla/admin-openrc.sh
+```
+
+![Screenshot 57](images/pic57.png)
+
+- Check the status of compute nodes:
+
+```bash
+openstack compute service list
+```
+
+![Screenshot 58](images/pic58.png)
+
+5. **Access Horizon Dashboard:**
+   Open your browser and visit:
+   `http://192.168.142.250`
+
+   Login credentials:
+
+   * **Username:** `admin`
+   * **Password:** (find it using)
+
+     ```bash
+     grep keystone_admin_password /etc/kolla/passwords.yml
+     ```
+
+![Screenshot 59](images/pic59.png)
+
+![Screenshot 60](images/pic60.png)
+
+![Screenshot 61](images/pic61.png)
 
 ---
 
-### 7. Start RabbitMQ
+### 🧪 (Optional) Setup Demo Environment
 
 ```bash
-systemctl start rabbitmq-server
-systemctl enable rabbitmq-server
+/usr/local/share/kolla-ansible/init-runonce
 ```
+
+![Screenshot 62](images/pic62.png)
 
 ---
 
-### 8. Install OpenStack with Packstack
+### 🖧 Explore Running Services on Nodes
 
-```bash
-packstack --install-hosts=127.0.0.1 --use-epel=n --provision-demo=n
-```
+Example Services by Role:
 
-After completion, login credentials will be stored in the file `keystonerc_admin`.
+#### Storage Node (`storage02`)
 
----
+* `cinder_backup`, `cinder_volume`, `iscsid`
+* `prometheus_cadvisor`, `fluentd`
 
-## Optional: Load CoreOS Image into Glance
+![Screenshot 63](images/pic63.png)
 
-```bash
-wget http://stable.release.core-os.net/amd64-usr/current/coreos_production_openstack_image.img.bz2
-bunzip2 coreos_production_openstack_image.img.bz2
+#### Network Node (`network01`)
 
-glance image-create --name "CoreOS" --container-format bare \
-  --disk-format qcow2 --file coreos_production_openstack_image.img \
-  --is-public True
-```
+* `neutron_l3_agent`, `neutron_dhcp_agent`, `neutron_openvswitch_agent`
+* `keepalived`, `haproxy`
 
----
-
-## Configure VNC and QEMU (Virtualized Environments)
-
-```bash
-# Set VNC proxy URL
-openstack-config --set /etc/nova/nova.conf DEFAULT \
-  novncproxy_base_url http://192.168.1.24:6080/vnc_auto.html
-
-# Use QEMU instead of KVM (running inside a VM)
-openstack-config --set /etc/nova/nova.conf libvirt virt_type qemu
-openstack-config --set /etc/nova/nova.conf DEFAULT compute_driver libvirt.LibvirtDriver
-
-# Enable required SELinux setting
-setsebool -P virt_use_execmem on
-
-# Symlink QEMU binary if needed
-ln -s /usr/libexec/qemu-kvm /usr/bin/qemu-system-x86_64
-
-# Restart services
-service libvirtd restart
-service openstack-nova-compute restart
-```
-
----
-
-## Done!
-
-Your Packstack OpenStack environment should now be up and running on **127.0.0.1**.
-
-To continue with CoreOS or additional OpenStack services, refer to official documentation.
+![Screenshot 64](images/pic64.png)
